@@ -1,0 +1,10 @@
+# Arduino build output
+/build/
+*.bin
+*.elf
+*.map
+*.hex
+
+# Editor / OS
+*.swp
+.DS_Store
