@@ -17,3 +17,6 @@ __pycache__/
 frames/
 live.jpg
 *.pt
+
+# Secrets (Telegram)
+.env

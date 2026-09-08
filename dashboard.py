@@ -14,15 +14,19 @@
 """
 import collections
 import json
+import os
+import sqlite3
+import subprocess
 import threading
 import time
+from datetime import datetime
 from pathlib import Path
 
 import cv2
 import numpy as np
 import onnxruntime as ort
 import requests
-from flask import Flask, Response, jsonify, request
+from flask import Flask, Response, jsonify, request, send_file
 
 from detect import (MODEL_PATH, STREAM_URL, TARGET_CLASSES, MjpegGrabber,
                     enhance, letterbox, postprocess)
@@ -30,6 +34,17 @@ from detect import (MODEL_PATH, STREAM_URL, TARGET_CLASSES, MjpegGrabber,
 CAM = "http://192.168.1.186"
 PORT = 8084
 JPEG_QUALITY = 80
+
+# --- рекордер кліпів (10 с, H.264 MP4, SQLite-каталог) ---------------------
+CLIPS_DIR = Path(__file__).with_name("clips")
+DB_PATH = Path(__file__).with_name("clips.db")
+CLIP_SECONDS = 10
+# статичний ffmpeg з libx264 (imageio-ffmpeg у cv-venv): системного
+# H.264-енкодера на Pi немає, cv2.VideoWriter('avc1') не відкривається
+import imageio_ffmpeg  # noqa: E402
+FFMPEG = imageio_ffmpeg.get_ffmpeg_exe()
+
+from telegram_notify import deliver  # noqa: E402
 
 FRAMESIZE_NAMES = {0: "qqvga", 1: "qqvga2", 2: "qcif", 3: "cif", 4: "qvga",
                    5: "vga", 6: "svga", 7: "xga", 8: "sxga", 9: "uxga",
@@ -153,10 +168,171 @@ class Detector(threading.Thread):
     def _event(self, ts, etype, classes):
         self.events.append({"t": ts, "type": etype, "classes": classes})
         del self.events[:-50]
+        # запис кліпу: на появу/зміну об'єктів (clear не тригерить)
+        if etype in ("appear", "change") and classes:
+            recorder.trigger(classes)
 
     def snapshot(self):
         with self.lock:
             return self.annotated
+
+
+# ------------------------------------------------------------ clip recorder
+def db_init():
+    """Схема каталогу кліпів."""
+    con = sqlite3.connect(DB_PATH)
+    con.execute("""CREATE TABLE IF NOT EXISTS clips (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts REAL NOT NULL,            -- unix-час початку кліпу
+        classes TEXT NOT NULL,       -- JSON-список класів у кліпі
+        path TEXT NOT NULL,          -- відносний шлях у clips/
+        size INTEGER NOT NULL,       -- байт
+        duration REAL NOT NULL,      -- секунд (фактична)
+        frames INTEGER NOT NULL)""")
+    con.commit()
+    con.close()
+
+
+def db_add(ts, classes, path, size, duration, frames):
+    con = sqlite3.connect(DB_PATH)
+    cur = con.execute(
+        "INSERT INTO clips (ts, classes, path, size, duration, frames) "
+        "VALUES (?,?,?,?,?,?)",
+        (ts, json.dumps(classes), path, size, duration, frames))
+    con.commit()
+    cid = cur.lastrowid
+    con.close()
+    return cid
+
+
+def db_list(limit=100):
+    con = sqlite3.connect(DB_PATH)
+    con.row_factory = sqlite3.Row
+    rows = con.execute(
+        "SELECT * FROM clips ORDER BY ts DESC LIMIT ?", (limit,)).fetchall()
+    con.close()
+    return [dict(r) for r in rows]
+
+
+class ClipRecorder(threading.Thread):
+    """Пише 10-секундні H.264 MP4-кліпи з анотованих кадрів детектора.
+
+    Тригер — подія детекції (appear/change/clear). Кліп починається з моменту
+    тригера і триває CLIP_SECONDS; кадри за цей час пишуться в тимчасовий
+    .mp4 через pipe у статичний ffmpeg (libx264, yuv420p — грає в браузерах),
+    потім реєструється в SQLite. Поки йде запис — нові тригери ігноруються
+    (один кліп за раз, інакше на Pi 2 кадри одночасно не потягнути).
+    """
+
+    def __init__(self):
+        super().__init__(daemon=True, name="clip-recorder")
+        self.lock = threading.Lock()
+        self.queue = []            # класи, що чекають на запис
+        self.writing = False       # зараз пишеться кліп
+        self.last_clip = None      # {id, ts, classes, path, size, duration, frames}
+        self.error = None
+        CLIPS_DIR.mkdir(exist_ok=True)
+        db_init()
+
+    def trigger(self, classes):
+        """Викликається з Detector._event — поставити класи в чергу."""
+        with self.lock:
+            if self.writing or self.queue:
+                return
+            self.queue = list(classes)
+
+    def status(self):
+        with self.lock:
+            return {"writing": self.writing, "pending": list(self.queue),
+                    "last": dict(self.last_clip) if self.last_clip else None,
+                    "error": self.error}
+
+    def run(self):
+        while True:
+            with self.lock:
+                classes = self.queue.pop(0) if self.queue else None
+                self.writing = classes is not None
+            if classes is None:
+                time.sleep(0.25)
+                continue
+            try:
+                self._record(classes)
+            except Exception as e:
+                self.error = f"{type(e).__name__}: {e}"
+                print(f"[recorder] {self.error}", flush=True)
+            finally:
+                with self.lock:
+                    self.writing = False
+
+    def _record(self, classes):
+        t0 = time.time()
+        stamp = datetime.fromtimestamp(t0).strftime("%Y%m%d_%H%M%S")
+        name = f"clip_{stamp}.mp4"
+        tmp = CLIPS_DIR / (name + ".part")
+        final = CLIPS_DIR / name
+        # -re не потрібен: кадри йдуть у реальному часі; -use_wallclock
+        # як timestamps дав би змінний fps, тому фіксуємо 10 fps на вході
+        proc = subprocess.Popen(
+            [FFMPEG, "-y", "-loglevel", "error",
+             "-f", "rawvideo", "-pix_fmt", "bgr24",
+             "-s", "{0}x{1}".format(*self._size()), "-r", "10",
+             "-i", "pipe:0",
+             "-c:v", "libx264", "-preset", "veryfast", "-crf", "26",
+             "-pix_fmt", "yuv420p", "-movflags", "+faststart",
+             "-f", "mp4", str(tmp)],
+            stdin=subprocess.PIPE)
+        frames = 0
+        deadline = t0 + CLIP_SECONDS
+        while time.time() < deadline:
+            jpg = detector.snapshot()
+            if jpg is not None:
+                img = cv2.imdecode(
+                    np.frombuffer(jpg, np.uint8), cv2.IMREAD_COLOR)
+                if img is not None:
+                    try:
+                        proc.stdin.write(img.tobytes())
+                        frames += 1
+                    except (BrokenPipeError, OSError):
+                        break
+            time.sleep(0.1)
+        try:
+            proc.stdin.close()
+        except OSError:
+            pass
+        proc.wait(timeout=30)
+        duration = time.time() - t0
+        if proc.returncode != 0 or not tmp.exists() or tmp.stat().st_size == 0:
+            tmp.unlink(missing_ok=True)
+            raise RuntimeError(f"ffmpeg exit {proc.returncode}")
+        tmp.rename(final)
+        cid = db_add(t0, classes, name, final.stat().st_size,
+                     round(duration, 1), frames)
+        with self.lock:
+            self.last_clip = {"id": cid, "ts": t0, "classes": classes,
+                              "path": name, "size": final.stat().st_size,
+                              "duration": round(duration, 1),
+                              "frames": frames}
+            self.error = None
+        print(f"[recorder] {name}: {frames} frames, "
+              f"{final.stat().st_size} B, {classes}", flush=True)
+        # відправка кліпу в Telegram одразу після реєстрації
+        stamp_h = datetime.fromtimestamp(t0).strftime("%H:%M:%S")
+        deliver(final, caption=f"🎥 Рух: {', '.join(classes)}\n"
+                               f"🕒 {stamp_h} · {duration:.0f} с · "
+                               f"{final.stat().st_size // 1024} КБ")
+
+    @staticmethod
+    def _size():
+        """Розмір кадру анотованого стріму (всі кадри однакові)."""
+        jpg = detector.snapshot()
+        if jpg is None:
+            return 640, 480
+        img = cv2.imdecode(np.frombuffer(jpg, np.uint8), cv2.IMREAD_COLOR)
+        return img.shape[1], img.shape[0]
+
+
+recorder = ClipRecorder()
+recorder.start()
 
 
 # ------------------------------------------------------------ camera poller
@@ -222,6 +398,7 @@ def state_payload():
                    "clients": status.get("stream_clients")},
         "detector": {"fps": fps, "frames": frames, "motion_pct": motion,
                      "detections": dets, "error": det_error},
+        "recorder": recorder.status(),
         "events": events,
     }
 
@@ -253,6 +430,31 @@ def stream():
 @app.route("/api/state")
 def api_state():
     return jsonify(state_payload())
+
+
+@app.route("/api/clips")
+def api_clips():
+    return jsonify({"clips": db_list(100)})
+
+
+@app.route("/api/clips/<int:cid>/video")
+def api_clip_video(cid):
+    row = next((r for r in db_list(1000) if r["id"] == cid), None)
+    if not row:
+        return ("кліп не знайдено", 404)
+    p = CLIPS_DIR / row["path"]
+    if not p.exists():
+        return ("файл кліпу відсутній", 404)
+    return send_file(p, mimetype="video/mp4",
+                     conditional=True, download_name=row["path"])
+
+
+@app.route("/api/clips/record", methods=["POST"])
+def api_clip_record():
+    """Ручний тригер запису (кнопка «Записати зараз» на панелі)."""
+    classes = request.get_json(silent=True) or {}
+    recorder.trigger(classes.get("classes") or ["manual"])
+    return jsonify({"queued": True})
 
 
 @app.route("/api/control", methods=["POST"])
