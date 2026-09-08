@@ -8,3 +8,12 @@
 # Editor / OS
 *.swp
 .DS_Store
+
+# Python
+__pycache__/
+*.pyc
+
+# Runtime artifacts
+frames/
+live.jpg
+*.pt

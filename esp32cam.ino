@@ -1,11 +1,14 @@
 /*
- * ESP32-CAM — WiFi AP + MJPEG streaming server
+ * ESP32-CAM — WiFi STA (+AP fallback) · MJPEG stream :81 · control API :80
  *
  * Після прошивки:
  *   1. ESP32 підключається до WiFi "Dev" — IP дивіться в серійному моніторі
  *      або відкрийте http://esp32cam.local
  *   2. Якщо домашня мережа недоступна — плата підніме точку доступу
  *      "ESP32-CAM-XXXXXX" (пароль: 12345678), адреса http://192.168.4.1/
+ *
+ * Порт 80  — керування: /, /status, /capture, /control, /settings
+ * Порт 81  — MJPEG стрім (окрема задача, не блокує керування)
  *
  * Плата: AI Thinker ESP32-CAM
  * Бібліотеки: esp32-camera (вбудована в ядро esp32)
@@ -15,6 +18,9 @@
 #include <WiFi.h>
 #include <WebServer.h>
 #include <ESPmDNS.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
+#include <freertos/task.h>
 
 // --- Домашня мережа (STA) ---
 const char *sta_ssid = "Dev";
@@ -43,35 +49,106 @@ const char *ap_password = "12345678";   // мін. 8 символів
 #define HREF_GPIO_NUM    23
 #define PCLK_GPIO_NUM    22
 
+#define FLASH_LED_PIN     4    // біла підсвітка на AI-Thinker
+#define STREAM_PORT       81
+#define MAX_STREAM_CLIENTS 5
+
 WebServer server(80);
+WiFiServer streamServer(STREAM_PORT);
+WiFiClient streamClients[MAX_STREAM_CLIENTS];
+SemaphoreHandle_t fbMutex;              // серіалізує esp_camera_fb_get
 
-// --- MJPEG стрім ---
-void handle_stream() {
-  WiFiClient client = server.client();
-  camera_fb_t *fb = NULL;
+volatile uint32_t min_frame_ms = 0;     // 0 = темп задає сенсор (~8 fps VGA)
+volatile uint8_t  led_state = 0;
+volatile uint8_t  stream_client_count = 0;
+bool sta_mode = false;
 
-  String head = "HTTP/1.1 200 OK\r\n"
-                "Content-Type: multipart/x-mixed-replace;boundary=frame\r\n\r\n";
-  server.sendContent(head);
+// --- MJPEG стрім: одна задача на core 0, до 3 клієнтів на спільний кадр ---
+static const char *STREAM_HEAD =
+  "HTTP/1.1 200 OK\r\n"
+  "Content-Type: multipart/x-mixed-replace;boundary=frame\r\n"
+  "Access-Control-Allow-Origin: *\r\n\r\n";
 
-  while (client.connected()) {
-    fb = esp_camera_fb_get();
-    if (!fb) {
-      Serial.println("Camera capture failed");
-      delay(100);
+static void drain_request(WiFiClient &c) {
+  String req;
+  uint32_t start = millis();
+  while (millis() - start < 500) {
+    while (c.available()) {
+      req += (char)c.read();
+      if (req.endsWith("\r\n\r\n") || req.length() > 2048) return;
+    }
+    delay(1);
+  }
+}
+
+void streamTask(void *pv) {
+  streamServer.begin();
+  streamServer.setNoDelay(true);
+  Serial.printf("Stream server on :%d\n", STREAM_PORT);
+
+  uint32_t last_frame_ms = 0;
+  for (;;) {
+    // прийом нових клієнтів
+    WiFiClient nc = streamServer.available();
+    if (nc) {
+      drain_request(nc);
+      nc.setTimeout(2000);
+      nc.setNoDelay(true);
+      bool placed = false;
+      for (int i = 0; i < MAX_STREAM_CLIENTS && !placed; i++) {
+        if (!streamClients[i] || !streamClients[i].connected()) {
+          streamClients[i] = nc;
+          streamClients[i].print(STREAM_HEAD);
+          placed = true;
+        }
+      }
+      if (!placed) {
+        nc.print("HTTP/1.1 503 Busy\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        nc.stop();
+      }
+    }
+
+    // облік живих клієнтів
+    uint8_t alive = 0;
+    for (int i = 0; i < MAX_STREAM_CLIENTS; i++) {
+      if (streamClients[i]) {
+        if (streamClients[i].connected()) alive++;
+        else streamClients[i].stop();
+      }
+    }
+    stream_client_count = alive;
+
+    if (alive == 0) { vTaskDelay(pdMS_TO_TICKS(50)); continue; }
+    if (min_frame_ms && millis() - last_frame_ms < min_frame_ms) {
+      vTaskDelay(pdMS_TO_TICKS(5));
       continue;
     }
 
-    String part = "--frame\r\nContent-Type: image/jpeg\r\nContent-Length: " +
-                  String(fb->len) + "\r\n\r\n";
-    server.sendContent(part);
-    client.write(fb->buf, fb->len);
-    server.sendContent("\r\n");
-
-    esp_camera_fb_return(fb);
-    fb = NULL;
+    camera_fb_t *fb = NULL;
+    if (xSemaphoreTake(fbMutex, pdMS_TO_TICKS(500)) == pdTRUE) {
+      fb = esp_camera_fb_get();
+      if (fb) {
+        for (int i = 0; i < MAX_STREAM_CLIENTS; i++) {
+          if (!streamClients[i] || !streamClients[i].connected()) continue;
+          String part = "--frame\r\nContent-Type: image/jpeg\r\nContent-Length: " +
+                        String(fb->len) + "\r\n\r\n";
+          streamClients[i].print(part);
+          size_t w = streamClients[i].write(fb->buf, fb->len);
+          streamClients[i].print("\r\n");
+          if (w != fb->len) streamClients[i].stop();  // повільний клієнт — від'єднуємо
+        }
+        esp_camera_fb_return(fb);
+      } else {
+        Serial.println("Camera capture failed");
+      }
+      xSemaphoreGive(fbMutex);
+      last_frame_ms = millis();
+    }
+    vTaskDelay(pdMS_TO_TICKS(1));
   }
 }
+
+// --- Керування (порт 80) ---
 
 void handle_index() {
   String html = "<!DOCTYPE html><html><head><meta charset='utf-8'>"
@@ -80,33 +157,158 @@ void handle_index() {
                 "<style>body{font-family:sans-serif;background:#111;color:#eee;"
                 "text-align:center;margin:0;padding:20px}"
                 "img{max-width:100%;border-radius:8px}"
-                "a.btn{display:inline-block;margin:10px;padding:12px 24px;"
-                "background:#2a7;color:#111;border-radius:6px;text-decoration:none;"
-                "font-weight:bold}</style></head><body>"
-                "<h2>ESP32-CAM Stream</h2>"
-                "<img src='/stream' alt='stream'>"
-                "<p><a class='btn' href='/status'>Status JSON</a></p>"
+                "a.btn,button{display:inline-block;margin:6px;padding:10px 18px;"
+                "background:#2a7;color:#111;border:0;border-radius:6px;"
+                "text-decoration:none;font-weight:bold;cursor:pointer;font-size:14px}"
+                "button.off{background:#555;color:#eee}"
+                "code{background:#222;padding:2px 6px;border-radius:4px}</style></head><body>"
+                "<h2>ESP32-CAM</h2>"
+                "<img id='cam' alt='stream'>"
+                "<p>"
+                "<a class='btn' href='/capture' target='_blank'>Snapshot</a>"
+                "<a class='btn' href='/settings'>Settings JSON</a>"
+                "<a class='btn' href='/status'>Status JSON</a>"
+                "</p><p>"
+                "<button onclick='ctl(\"led\",\"+1-led_state\")'>LED</button>"
+                "<button class='off' onclick='ctl(\"led\",0)'>LED OFF</button>"
+                "<button onclick='ctl(\"vflip\",\"+1-vflip\")'>VFlip</button>"
+                "<button onclick='ctl(\"hmirror\",\"+1-hmirror\")'>HMirror</button>"
+                "<button onclick='ctl(\"quality\",12)'>Q12</button>"
+                "<button onclick='ctl(\"framesize\",\"vga\")'>VGA</button>"
+                "<button onclick='ctl(\"framesize\",\"svga\")'>SVGA</button>"
+                "</p><p><code>/control?var=framesize|quality|brightness|contrast|saturation|vflip|hmirror|led|fps&amp;val=…</code></p>"
+                "<script>var b=location.hostname;document.getElementById('cam').src='http://'+b+':81/stream?'+Date.now();"
+                "function ctl(v,val){fetch('/control?var='+v+'&val='+val).then(r=>r.text()).then(t=>console.log(v,t))}</script>"
                 "</body></html>";
   server.send(200, "text/html", html);
 }
 
 void handle_status() {
-  String ip = (WiFi.status() == WL_CONNECTED) ? WiFi.localIP().toString()
-                                              : WiFi.softAPIP().toString();
+  String ip = sta_mode ? WiFi.localIP().toString() : WiFi.softAPIP().toString();
   String json = "{\"chip\":\"" + String(ESP.getChipModel()) + "\"" +
                 ",\"revision\":" + String(ESP.getChipRevision()) +
-                ",\"flash\":" + String(ESP.getFlashChipSize() / 1048576) + "MB" +
+                ",\"flash\":" + String(ESP.getFlashChipSize() / 1048576) + "\"" +
                 ",\"heap_free\":" + String(ESP.getFreeHeap()) +
                 ",\"uptime_s\":" + String(millis() / 1000) +
-                ",\"wifi_mode\":\"" + (WiFi.status() == WL_CONNECTED ? "STA" : "AP") + "\"" +
-                ",\"ssid\":\"" + (WiFi.status() == WL_CONNECTED ? sta_ssid : "ESP32-CAM-AP") + "\"" +
-                ",\"ip\":\"" + ip + "\"}";
+                ",\"wifi_mode\":\"" + (sta_mode ? "STA" : "AP") + "\"" +
+                ",\"ssid\":\"" + (sta_mode ? sta_ssid : "ESP32-CAM-AP") + "\"" +
+                ",\"ip\":\"" + ip + "\"" +
+                ",\"stream_port\":" + String(STREAM_PORT) +
+                ",\"stream_clients\":" + String(stream_client_count) +
+                ",\"led\":" + String(led_state) + "}";
   server.send(200, "application/json", json);
+}
+
+void handle_capture() {
+  camera_fb_t *fb = NULL;
+  if (xSemaphoreTake(fbMutex, pdMS_TO_TICKS(1500)) != pdTRUE) {
+    server.send(503, "text/plain", "busy");
+    return;
+  }
+  fb = esp_camera_fb_get();
+  if (!fb) {
+    xSemaphoreGive(fbMutex);
+    server.send(500, "text/plain", "capture failed");
+    return;
+  }
+  String head = "HTTP/1.1 200 OK\r\n"
+                "Content-Type: image/jpeg\r\n"
+                "Content-Length: " + String(fb->len) + "\r\n"
+                "Access-Control-Allow-Origin: *\r\n"
+                "Connection: close\r\n\r\n";
+  server.sendContent(head);
+  server.client().write(fb->buf, fb->len);
+  esp_camera_fb_return(fb);
+  xSemaphoreGive(fbMutex);
+}
+
+void handle_settings() {
+  sensor_t *s = esp_camera_sensor_get();
+  if (!s) {
+    server.send(500, "application/json", "{\"error\":\"no sensor\"}");
+    return;
+  }
+  char buf[384];
+  snprintf(buf, sizeof(buf),
+           "{\"framesize\":%d,\"quality\":%d,\"brightness\":%d,\"contrast\":%d,"
+           "\"saturation\":%d,\"sharpness\":%d,\"special_effect\":%d,"
+           "\"vflip\":%d,\"hmirror\":%d,\"led\":%d,\"fps_limit_ms\":%u,"
+           "\"stream_clients\":%u,\"stream_port\":%d}",
+           s->status.framesize, s->status.quality, s->status.brightness,
+           s->status.contrast, s->status.saturation, s->status.sharpness,
+           s->status.special_effect, s->status.vflip, s->status.hmirror,
+           led_state, min_frame_ms, stream_client_count, STREAM_PORT);
+  server.send(200, "application/json", buf);
+}
+
+static bool framesize_from_name(const String &n, framesize_t &out) {
+  String v = n; v.toLowerCase();
+  if      (v == "qqvga") out = FRAMESIZE_QQVGA;
+  else if (v == "qvga")  out = FRAMESIZE_QVGA;
+  else if (v == "vga")   out = FRAMESIZE_VGA;
+  else if (v == "svga")  out = FRAMESIZE_SVGA;
+  else if (v == "xga")   out = FRAMESIZE_XGA;
+  else if (v == "sxga")  out = FRAMESIZE_SXGA;
+  else if (v == "uxga")  out = FRAMESIZE_UXGA;
+  else return false;
+  return true;
+}
+
+void handle_control() {
+  if (!server.hasArg("var") || !server.hasArg("val")) {
+    server.send(400, "text/plain", "usage: /control?var=NAME&val=VALUE");
+    return;
+  }
+  String var = server.arg("var");
+  String val = server.arg("val");
+  sensor_t *s = esp_camera_sensor_get();
+  if (!s) {
+    server.send(500, "text/plain", "no sensor");
+    return;
+  }
+
+  String res = "ok " + var + "=" + val;
+  bool is_toggle = val.startsWith("+1-");   // "+1-<current>" -> інвертувати
+  int  ival = val.toInt();
+
+  if (var == "framesize") {
+    framesize_t fs;
+    if (!framesize_from_name(val, fs)) { server.send(400, "text/plain", "bad framesize (qqvga..uxga)"); return; }
+    s->set_framesize(s, fs);
+  } else if (var == "quality") {
+    if (ival < 10 || ival > 63) { server.send(400, "text/plain", "quality: 10..63"); return; }
+    s->set_quality(s, ival);
+  } else if (var == "brightness") {
+    s->set_brightness(s, constrain(ival, -2, 2));
+  } else if (var == "contrast") {
+    s->set_contrast(s, constrain(ival, -2, 2));
+  } else if (var == "saturation") {
+    s->set_saturation(s, constrain(ival, -2, 2));
+  } else if (var == "vflip") {
+    int cur = s->status.vflip;
+    s->set_vflip(s, is_toggle ? !cur : (ival != 0));
+  } else if (var == "hmirror") {
+    int cur = s->status.hmirror;
+    s->set_hmirror(s, is_toggle ? !cur : (ival != 0));
+  } else if (var == "led") {
+    int cur = led_state;
+    led_state = is_toggle ? !cur : (ival != 0);
+    digitalWrite(FLASH_LED_PIN, led_state ? HIGH : LOW);
+  } else if (var == "fps") {
+    min_frame_ms = (ival > 0 && ival <= 30) ? 1000 / ival : 0;
+  } else {
+    server.send(400, "text/plain", "unknown var: " + var);
+    return;
+  }
+  server.send(200, "text/plain", res);
 }
 
 void setup() {
   Serial.begin(115200);
   Serial.println("\n=== ESP32-CAM boot ===");
+
+  pinMode(FLASH_LED_PIN, OUTPUT);
+  digitalWrite(FLASH_LED_PIN, LOW);
 
   // Power-cycle сенсора перед ініціалізацією (допомагає при "липкому" I2C)
   pinMode(PWDN_GPIO_NUM, OUTPUT);
@@ -169,6 +371,8 @@ void setup() {
   s->set_vflip(s, 0);       // переверніть у 1, якщо зображення догори дриґом
   s->set_hmirror(s, 0);
 
+  fbMutex = xSemaphoreCreateMutex();
+
   // WiFi: спершу STA (домашня мережа), при невдачі — резервна AP
   WiFi.mode(WIFI_STA);
   WiFi.setHostname(hostname);
@@ -183,6 +387,7 @@ void setup() {
   }
 
   if (sta_ok) {
+    sta_mode = true;
     WiFi.setSleep(false);   // вимкнути WiFi power-save (інакше пінг ~800мс і обриви)
     Serial.println("\nSTA підключено!");
     Serial.print("IP: http://");
@@ -206,13 +411,30 @@ void setup() {
     Serial.printf("mDNS: http://%s.local\n", hostname);
   }
 
+  // Керування — порт 80
+  server.enableCORS(true);
   server.on("/", HTTP_GET, handle_index);
-  server.on("/stream", HTTP_GET, handle_stream);
   server.on("/status", HTTP_GET, handle_status);
+  server.on("/capture", HTTP_GET, handle_capture);
+  server.on("/settings", HTTP_GET, handle_settings);
+  server.on("/control", HTTP_GET, handle_control);
   server.begin();
-  Serial.println("HTTP server started");
+  Serial.println("Control server started on :80");
+
+  // Стрім — окрема задача на core 0, порт 81
+  xTaskCreatePinnedToCore(streamTask, "stream", 8192, NULL, 3, NULL, 0);
 }
 
 void loop() {
   server.handleClient();
+
+  // автовідновлення WiFi у режимі STA
+  static uint32_t last_wifi_check = 0;
+  if (sta_mode && millis() - last_wifi_check > 10000) {
+    last_wifi_check = millis();
+    if (WiFi.status() != WL_CONNECTED) {
+      Serial.println("WiFi відвалився — reconnect...");
+      WiFi.reconnect();
+    }
+  }
 }
