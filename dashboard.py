@@ -316,9 +316,9 @@ class ClipRecorder(threading.Thread):
         print(f"[recorder] {name}: {frames} frames, "
               f"{final.stat().st_size} B, {classes}", flush=True)
         # відправка кліпу в Telegram одразу після реєстрації
-        stamp_h = datetime.fromtimestamp(t0).strftime("%H:%M:%S")
+        stamp = datetime.fromtimestamp(t0).strftime("%d.%m.%Y %H:%M:%S")
         deliver(final, caption=f"🎥 Рух: {', '.join(classes)}\n"
-                               f"🕒 {stamp_h} · {duration:.0f} с · "
+                               f"🕒 {stamp} · {duration:.0f} с · "
                                f"{final.stat().st_size // 1024} КБ")
 
     @staticmethod

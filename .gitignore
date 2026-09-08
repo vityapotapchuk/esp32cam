@@ -20,3 +20,8 @@ live.jpg
 
 # Secrets (Telegram)
 .env
+
+# Clips / DB / runtime logs
+clips/
+clips.db
+.tg_sent.log
