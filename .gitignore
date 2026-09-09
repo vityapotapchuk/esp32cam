@@ -24,4 +24,5 @@ live.jpg
 # Clips / DB / runtime logs
 clips/
 clips.db
+journal.db
 .tg_sent.log

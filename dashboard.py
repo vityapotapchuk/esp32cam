@@ -35,10 +35,26 @@ CAM = "http://192.168.1.186"
 PORT = 8084
 JPEG_QUALITY = 80
 
+# --- дебаунс подій детекції -----------------------------------------------
+# Хибні спалахи (крісло при зміні освітлення) живуть 1-2 кадри (~0.2 с).
+# Подія appear/change створюється лише коли кандидат протримався
+# CONFIRM_FRAMES кадрів підряд І щонайменше CONFIRM_SECONDS секунд;
+# clear — після CLEAR_FRAMES кадрів підряд без об'єктів.
+CONFIRM_FRAMES = 3
+CONFIRM_SECONDS = 0.3
+CLEAR_FRAMES = 2
+
 # --- рекордер кліпів (10 с, H.264 MP4, SQLite-каталог) ---------------------
 CLIPS_DIR = Path(__file__).with_name("clips")
 DB_PATH = Path(__file__).with_name("clips.db")
 CLIP_SECONDS = 10
+# Оригінали кліпів лишаються в clips/ — внутрішня пам'ять карти (SD, mmcblk0).
+# У Telegram йде тільки легка версія (clips/light/, 360p, високий CRF).
+LIGHT_DIR = CLIPS_DIR / "light"
+LIGHT_HEIGHT = 360
+LIGHT_CRF = "32"
+# Журнал руху — ОКРЕМА файл-база (каталог кліпів живе в clips.db)
+JOURNAL_DB = Path(__file__).with_name("journal.db")
 # статичний ffmpeg з libx264 (imageio-ffmpeg у cv-venv): системного
 # H.264-енкодера на Pi немає, cv2.VideoWriter('avc1') не відкривається
 import imageio_ffmpeg  # noqa: E402
@@ -77,6 +93,12 @@ class Detector(threading.Thread):
         self.last_classes = set()
         self.error = None
         self.stopped = False
+        self.enabled = True            # вимикач детекції (кнопка на панелі)
+        # --- дебаунс: кандидат-класи, що чекають підтвердження ---
+        self._cand = set()             # класи-кандидати на appear/change
+        self._cand_n = 0               # скільки кадрів підряд кандидат тримається
+        self._cand_t0 = 0.0            # час першого кадру кандидата
+        self._clear_n = 0              # кадри підряд без об'єктів
 
     def run(self):
         sess = ort.InferenceSession(MODEL_PATH,
@@ -87,6 +109,27 @@ class Detector(threading.Thread):
         ema = 0.0
 
         while not self.stopped:
+            if not self.enabled:
+                # Детектор вимкнено кнопкою: YOLO-інференс не рахуємо
+                # (звільняємо CPU), але кадр оновлюємо — живий стрім
+                # продовжується, просто без рамок і подій.
+                frame = self.grabber.read()
+                if frame is not None:
+                    try:
+                        ok, jpg = cv2.imencode(
+                            ".jpg", enhance(frame),
+                            [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
+                        with self.lock:
+                            if ok:
+                                self.annotated = jpg.tobytes()
+                            self.dets = []
+                            self.fps = 0.0
+                            self.motion = 0.0
+                            self.last_classes = set()
+                    except Exception:
+                        pass
+                time.sleep(0.2)
+                continue
             frame = self.grabber.read()
             if frame is None:
                 time.sleep(0.05)
@@ -147,6 +190,8 @@ class Detector(threading.Thread):
                         for bx, cf, c in raw]
                 classes = {d["cls"] for d in dets}
                 now = time.time()
+                confirmed, gone = self._debounce(classes, now)
+
                 with self.lock:
                     if ok:
                         self.annotated = jpg.tobytes()
@@ -154,23 +199,51 @@ class Detector(threading.Thread):
                     self.fps = round(float(np.mean(fps_hist)), 1) if fps_hist else 0.0
                     self.frames += 1
                     self.motion = round(ema, 1)
-                    if classes and not self.last_classes:
-                        self._event(now, "appear", sorted(classes))
-                    elif classes and classes != self.last_classes:
-                        self._event(now, "change", sorted(classes))
-                    elif not classes and self.last_classes:
+                    # подія — лише після підтвердження дебаунсом
+                    if confirmed and classes != self.last_classes:
+                        etype = "appear" if not self.last_classes else "change"
+                        self._event(now, etype, sorted(classes))
+                        self.last_classes = set(classes)
+                    elif gone and self.last_classes:
                         self._event(now, "clear", [])
-                    self.last_classes = classes
+                        self.last_classes = set()
             except Exception as e:  # не вмирати від разових збоїв
                 self.error = str(e)
                 time.sleep(0.5)
 
+    def _debounce(self, classes, now):
+        """Дебаунс подій. classes — множина класів поточного кадру.
+
+        Повертає (confirmed, gone): confirmed=True — класи протримались
+        CONFIRM_FRAMES кадрів підряд і CONFIRM_SECONDS секунд (appear/change);
+        gone=True — CLEAR_FRAMES кадрів підряд без об'єктів (clear).
+        Викликається на кожному кадрі детекції.
+        """
+        if classes:
+            if classes == self._cand:
+                self._cand_n += 1
+            else:
+                self._cand = set(classes)
+                self._cand_n = 1
+                self._cand_t0 = now
+            self._clear_n = 0
+        else:
+            self._clear_n += 1
+            self._cand = set()
+            self._cand_n = 0
+        confirmed = (bool(classes) and self._cand_n >= CONFIRM_FRAMES
+                     and now - self._cand_t0 >= CONFIRM_SECONDS)
+        gone = not classes and self._clear_n >= CLEAR_FRAMES
+        return confirmed, gone
+
     def _event(self, ts, etype, classes):
         self.events.append({"t": ts, "type": etype, "classes": classes})
         del self.events[:-50]
-        # запис кліпу: на появу/зміну об'єктів (clear не тригерить)
+        # початок руху (поява/зміна об'єктів) — у журнал (окрема БД),
+        # clear не тригерить ні журнал, ні запис
         if etype in ("appear", "change") and classes:
-            recorder.trigger(classes)
+            jid = journal_add(ts, classes)
+            recorder.trigger(classes, jid)
 
     def snapshot(self):
         with self.lock:
@@ -214,6 +287,69 @@ def db_list(limit=100):
     return [dict(r) for r in rows]
 
 
+# ------------------------------------------------------- журнал руху (окрема БД)
+def journal_init():
+    """Схема журналу руху в journal.db — окрема файл-база.
+
+    start_ts — unix-час ПОЧАТКУ руху (момент події appear/change),
+    start_local — те саме локальним часом 'YYYY-MM-DD HH:MM:SS' (дата + час).
+    """
+    con = sqlite3.connect(JOURNAL_DB)
+    con.execute("""CREATE TABLE IF NOT EXISTS motion_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        start_ts REAL NOT NULL,      -- unix-час початку руху
+        start_local TEXT NOT NULL,   -- локальні дата і час початку руху
+        classes TEXT NOT NULL,       -- JSON-список класів на початку руху
+        clip_id INTEGER,             -- id кліпу в clips.db (якщо записано)
+        clip_path TEXT,              -- ім'я файлу оригіналу в clips/
+        light_path TEXT,             -- ім'я файлу легкої версії в clips/light/
+        tg_sent INTEGER NOT NULL DEFAULT 0)""")
+    con.commit()
+    con.close()
+
+
+def journal_add(start_ts, classes):
+    """Записати початок руху; повернути id рядка журналу."""
+    con = sqlite3.connect(JOURNAL_DB)
+    cur = con.execute(
+        "INSERT INTO motion_log (start_ts, start_local, classes) "
+        "VALUES (?,?,?)",
+        (start_ts,
+         datetime.fromtimestamp(start_ts).strftime("%Y-%m-%d %H:%M:%S"),
+         json.dumps(classes)))
+    con.commit()
+    jid = cur.lastrowid
+    con.close()
+    return jid
+
+
+def journal_update_clip(jid, clip_id, clip_path, light_path):
+    """Після запису кліпу прив'язати його (оригінал + легка версія) до події."""
+    con = sqlite3.connect(JOURNAL_DB)
+    con.execute(
+        "UPDATE motion_log SET clip_id=?, clip_path=?, light_path=? "
+        "WHERE id=?", (clip_id, clip_path, light_path, jid))
+    con.commit()
+    con.close()
+
+
+def journal_mark_sent(jid):
+    con = sqlite3.connect(JOURNAL_DB)
+    con.execute("UPDATE motion_log SET tg_sent=1 WHERE id=?", (jid,))
+    con.commit()
+    con.close()
+
+
+def journal_list(limit=100):
+    con = sqlite3.connect(JOURNAL_DB)
+    con.row_factory = sqlite3.Row
+    rows = con.execute(
+        "SELECT * FROM motion_log ORDER BY start_ts DESC LIMIT ?",
+        (limit,)).fetchall()
+    con.close()
+    return [dict(r) for r in rows]
+
+
 class ClipRecorder(threading.Thread):
     """Пише 10-секундні H.264 MP4-кліпи з анотованих кадрів детектора.
 
@@ -227,19 +363,21 @@ class ClipRecorder(threading.Thread):
     def __init__(self):
         super().__init__(daemon=True, name="clip-recorder")
         self.lock = threading.Lock()
-        self.queue = []            # класи, що чекають на запис
+        self.queue = []            # (класи, journal_id), що чекають на запис
         self.writing = False       # зараз пишеться кліп
         self.last_clip = None      # {id, ts, classes, path, size, duration, frames}
         self.error = None
         CLIPS_DIR.mkdir(exist_ok=True)
+        LIGHT_DIR.mkdir(exist_ok=True)
         db_init()
+        journal_init()
 
-    def trigger(self, classes):
+    def trigger(self, classes, journal_id=None):
         """Викликається з Detector._event — поставити класи в чергу."""
         with self.lock:
             if self.writing or self.queue:
                 return
-            self.queue = list(classes)
+            self.queue = [list(classes), journal_id]
 
     def status(self):
         with self.lock:
@@ -250,13 +388,14 @@ class ClipRecorder(threading.Thread):
     def run(self):
         while True:
             with self.lock:
-                classes = self.queue.pop(0) if self.queue else None
-                self.writing = classes is not None
-            if classes is None:
+                item = self.queue.pop(0) if self.queue else None
+                self.writing = item is not None
+            if item is None:
                 time.sleep(0.25)
                 continue
+            classes, jid = item[0], item[1]
             try:
-                self._record(classes)
+                self._record(classes, jid)
             except Exception as e:
                 self.error = f"{type(e).__name__}: {e}"
                 print(f"[recorder] {self.error}", flush=True)
@@ -264,12 +403,15 @@ class ClipRecorder(threading.Thread):
                 with self.lock:
                     self.writing = False
 
-    def _record(self, classes):
+    def _record(self, classes, journal_id=None):
         t0 = time.time()
         stamp = datetime.fromtimestamp(t0).strftime("%Y%m%d_%H%M%S")
         name = f"clip_{stamp}.mp4"
         tmp = CLIPS_DIR / (name + ".part")
         final = CLIPS_DIR / name
+        light_name = "light_" + name
+        light_tmp = LIGHT_DIR / (light_name + ".part")
+        light_final = LIGHT_DIR / light_name
         # -re не потрібен: кадри йдуть у реальному часі; -use_wallclock
         # як timestamps дав би змінний fps, тому фіксуємо 10 fps на вході
         proc = subprocess.Popen(
@@ -305,21 +447,45 @@ class ClipRecorder(threading.Thread):
             tmp.unlink(missing_ok=True)
             raise RuntimeError(f"ffmpeg exit {proc.returncode}")
         tmp.rename(final)
+        # --- легка версія для Telegram: 360p, високий CRF, без звуку ---
+        light_name_db = None
+        try:
+            subprocess.run(
+                [FFMPEG, "-y", "-loglevel", "error", "-i", str(final),
+                 "-vf", f"scale=-2:{LIGHT_HEIGHT}", "-c:v", "libx264",
+                 "-preset", "veryfast", "-crf", LIGHT_CRF,
+                 "-pix_fmt", "yuv420p", "-movflags", "+faststart",
+                 "-an", str(light_tmp)],
+                check=True, timeout=120)
+            light_tmp.rename(light_final)
+            light_name_db = light_name
+        except Exception as e:
+            light_tmp.unlink(missing_ok=True)
+            print(f"[recorder] light transcode failed: {e}", flush=True)
         cid = db_add(t0, classes, name, final.stat().st_size,
                      round(duration, 1), frames)
+        # --- журнал: прив'язати кліп (оригінал + легка версія) до події ---
+        if journal_id:
+            journal_update_clip(journal_id, cid, name, light_name_db)
         with self.lock:
             self.last_clip = {"id": cid, "ts": t0, "classes": classes,
                               "path": name, "size": final.stat().st_size,
                               "duration": round(duration, 1),
-                              "frames": frames}
+                              "frames": frames, "light": light_name_db}
             self.error = None
         print(f"[recorder] {name}: {frames} frames, "
-              f"{final.stat().st_size} B, {classes}", flush=True)
-        # відправка кліпу в Telegram одразу після реєстрації
-        stamp = datetime.fromtimestamp(t0).strftime("%d.%m.%Y %H:%M:%S")
-        deliver(final, caption=f"🎥 Рух: {', '.join(classes)}\n"
-                               f"🕒 {stamp} · {duration:.0f} с · "
-                               f"{final.stat().st_size // 1024} КБ")
+              f"{final.stat().st_size} B, light={light_name_db}, {classes}",
+              flush=True)
+        # --- Telegram: тільки ЛЕГКА версія кліпу ---
+        from telegram_notify import TOKEN as TG_TOKEN, CHAT_ID as TG_CHAT
+        if light_name_db and TG_TOKEN and TG_CHAT:
+            stamp = datetime.fromtimestamp(t0).strftime("%d.%m.%Y %H:%M:%S")
+            deliver(light_final,
+                    caption=f"🎥 Рух: {', '.join(classes)}\n"
+                            f"🕒 {stamp} · {duration:.0f} с · "
+                            f"{light_final.stat().st_size // 1024} КБ (light)")
+            if journal_id:
+                journal_mark_sent(journal_id)
 
     @staticmethod
     def _size():
@@ -397,7 +563,8 @@ def state_payload():
                    and grabber.frame is not None,
                    "clients": status.get("stream_clients")},
         "detector": {"fps": fps, "frames": frames, "motion_pct": motion,
-                     "detections": dets, "error": det_error},
+                     "detections": dets, "error": det_error,
+                     "enabled": detector.enabled},
         "recorder": recorder.status(),
         "events": events,
     }
@@ -437,6 +604,12 @@ def api_clips():
     return jsonify({"clips": db_list(100)})
 
 
+@app.route("/api/journal")
+def api_journal():
+    """Журнал руху: дата+час початку руху, класи, кліпи, статус Telegram."""
+    return jsonify({"journal": journal_list(200)})
+
+
 @app.route("/api/clips/<int:cid>/video")
 def api_clip_video(cid):
     row = next((r for r in db_list(1000) if r["id"] == cid), None)
@@ -455,6 +628,20 @@ def api_clip_record():
     classes = request.get_json(silent=True) or {}
     recorder.trigger(classes.get("classes") or ["manual"])
     return jsonify({"queued": True})
+
+
+@app.route("/api/detector/toggle", methods=["POST"])
+def api_detector_toggle():
+    """Увімкнути/вимкнути YOLO-детекцію (кнопка на панелі «Детекція руху»).
+
+    POST {"enabled": true|false}. При вимкненні інференс не рахується
+    (CPU звільняється), стрім продовжує йти без рамок, подій і запису.
+    """
+    data = request.get_json(silent=True) or {}
+    if not isinstance(data.get("enabled"), bool):
+        return jsonify({"ok": False, "error": "потрібен enabled: bool"}), 400
+    detector.enabled = data["enabled"]
+    return jsonify({"ok": True, "enabled": detector.enabled})
 
 
 @app.route("/api/control", methods=["POST"])

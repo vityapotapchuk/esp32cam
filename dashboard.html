@@ -134,6 +134,10 @@ select{background:var(--panel2);color:var(--text);border:1px solid var(--line);
         <h2>Журнал подій</h2>
         <div id="events"><span style="color:var(--dim)">порожньо</span></div>
       </div>
+      <div class="panel" style="margin-top:14px">
+        <h2>Журнал руху <span style="text-transform:none;letter-spacing:0">(journal.db)</span></h2>
+        <div id="journal"><span style="color:var(--dim)">порожньо</span></div>
+      </div>
     </div>
   </div>
 </div>
@@ -254,6 +258,17 @@ function fmtDur(s){
 function tick(){
   fetch('/api/state').then(r=>r.json()).then(render)
     .catch(()=>{$('dot').className='dot';});
+  fetch('/api/journal').then(r=>r.json()).then(j=>{
+    const rows=j.journal||[];
+    if(!rows.length){$('journal').innerHTML='<span style="color:var(--dim)">порожньо</span>';return;}
+    $('journal').innerHTML=rows.map(e=>{
+      const tags=(e.classes?JSON.parse(e.classes):[]).map(c=>
+        `<span class="tag ${c=='person'?'':'animal'}">${c}</span>`).join('');
+      const clip=e.clip_id?`<a href="/api/clips/${e.clip_id}/video" target="_blank">🎬</a>`:'';
+      const tg=e.tg_sent?'✓':'—';
+      return `<div class="ev appear"><span class="t">${e.start_local}</span>${tags} ${clip} <span style="color:var(--dim)">tg:${tg}</span></div>`;
+    }).join('');
+  }).catch(()=>{});
 }
 tick(); setInterval(tick,1000);
 setInterval(()=>$('clock').textContent=new Date().toLocaleTimeString('uk-UA'),1000);
