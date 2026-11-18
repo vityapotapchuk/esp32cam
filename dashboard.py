@@ -62,7 +62,8 @@ JOURNAL_DB = Path(__file__).with_name("journal.db")
 import imageio_ffmpeg  # noqa: E402
 FFMPEG = imageio_ffmpeg.get_ffmpeg_exe()
 
-from telegram_notify import deliver  # noqa: E402
+from telegram_notify import deliver, send_message  # noqa: E402
+import event_log  # noqa: E402
 
 FRAMESIZE_NAMES = {0: "qqvga", 1: "qqvga2", 2: "qcif", 3: "cif", 4: "qvga",
                    5: "vga", 6: "svga", 7: "xga", 8: "sxga", 9: "uxga",
@@ -142,7 +143,12 @@ class Detector(threading.Thread):
                 self.sched_active = sched_on
                 self.sched_reason = sched_reason
                 self.sched_profile = sched_profile
-            if not self.enabled or not sched_on:
+            # Вдома нікого (охорона) — детектор працює й поза графіком:
+            # всі детекції йдуть у Telegram. Ручний вимикач — важливіший.
+            away = activity_log.alerts_on()
+            if not self.enabled or (not sched_on and not away):
+                if self.enabled:
+                    activity_log.tick(time.time())   # таймер «5 хв нікого» іде й на паузі
                 # Детектор вимкнено кнопкою або графіком: YOLO-інференс не
                 # рахуємо (звільняємо CPU), але кадр оновлюємо — живий стрім
                 # продовжується, просто без рамок і подій.
@@ -246,7 +252,7 @@ class Detector(threading.Thread):
                     # подія — лише після підтвердження дебаунсом
                     if confirmed and classes != self.last_classes:
                         etype = "appear" if not self.last_classes else "change"
-                        self._event(now, etype, sorted(classes))
+                        self._event(now, etype, sorted(classes), dets)
                         self.last_classes = set(classes)
                     elif gone and self.last_classes:
                         self._event(now, "clear", [])
@@ -311,14 +317,18 @@ class Detector(threading.Thread):
         gone = not classes and self._clear_n >= CLEAR_FRAMES
         return confirmed, gone
 
-    def _event(self, ts, etype, classes):
+    def _event(self, ts, etype, classes, dets=None):
         self.events.append({"t": ts, "type": etype, "classes": classes})
         del self.events[:-50]
-        # початок руху (поява/зміна об'єктів) — у журнал (окрема БД),
-        # clear не тригерить ні журнал, ні запис
+        # початок руху (поява/зміна об'єктів) — у журнал (окрема БД + файл),
+        # clear не тригерить ні журнал, ні запис.
+        # Telegram — лише коли вдома нікого (охорона в activity.py).
         if etype in ("appear", "change") and classes:
+            alert = activity_log.alerts_on(ts)
             jid = journal_add(ts, classes)
-            recorder.trigger(classes, jid)
+            event_log.write("motion", ts, dets, kind=etype, alert=alert,
+                            journal_id=jid)
+            recorder.trigger(classes, jid, alert=alert)
 
     def snapshot(self):
         with self.lock:
@@ -469,7 +479,7 @@ class ClipRecorder:
             self._worker = w
             w.start()
 
-    def trigger(self, classes, journal_id=None):
+    def trigger(self, classes, journal_id=None, alert=True):
         """Викликається з Detector._event — поставити класи в чергу."""
         with self.lock:
             w = self._worker
@@ -488,7 +498,7 @@ class ClipRecorder:
                 self._proc = None
             if self.writing or self.queue:
                 return
-            self.queue = [(list(classes), journal_id)]
+            self.queue = [(list(classes), journal_id, alert)]
         if stale is not None:
             try:
                 stale.kill()
@@ -513,8 +523,8 @@ class ClipRecorder:
                 time.sleep(0.25)
                 continue
             try:
-                classes, jid = item
-                self._record(classes, jid)
+                classes, jid, alert = item
+                self._record(classes, jid, alert)
             except Exception as e:
                 self.error = f"{type(e).__name__}: {e}"
                 _log(f"[recorder] {self.error}")
@@ -523,7 +533,7 @@ class ClipRecorder:
                     self.writing = False
                     self._proc = None
 
-    def _record(self, classes, journal_id=None):
+    def _record(self, classes, journal_id=None, alert=True):
         t0 = time.time()
         stamp = datetime.fromtimestamp(t0).strftime("%Y%m%d_%H%M%S")
         name = f"clip_{stamp}.mp4"
@@ -614,10 +624,10 @@ class ClipRecorder:
               flush=True)
         # --- Telegram: тільки ЛЕГКА версія кліпу ---
         from telegram_notify import TOKEN as TG_TOKEN, CHAT_ID as TG_CHAT
-        if light_name_db and TG_TOKEN and TG_CHAT:
+        if alert and light_name_db and TG_TOKEN and TG_CHAT:
             stamp = datetime.fromtimestamp(t0).strftime("%d.%m.%Y %H:%M:%S")
             deliver(light_final,
-                    caption=f"🎥 Рух: {', '.join(classes)}\n"
+                    caption=f"🚨 Вдома нікого · рух: {', '.join(classes)}\n"
                             f"🕒 {stamp} · {duration:.0f} с · "
                             f"{light_final.stat().st_size // 1024} КБ (light)")
             if journal_id:
@@ -634,7 +644,21 @@ class ClipRecorder:
 
 
 recorder = ClipRecorder()
-activity_log = activity.ActivityLog()
+def _on_activity(ev):
+    """Кожна подія журналу дій — у файл; зміна охорони — ще й у Telegram."""
+    etype = "guard" if ev.get("kind") in ("away", "home") else "activity"
+    event_log.write(etype, ev.get("ts"), None, kind=ev.get("kind"),
+                    actor=ev.get("actor"), zone=ev.get("zone"),
+                    duration=ev.get("duration"), count=ev.get("count"),
+                    text=ev.get("text"), snap=ev.get("snap"))
+    if etype == "guard":
+        msg = ("🔒 Вдома нікого вже 5 хв — надсилаю всі детекції руху"
+               if ev["kind"] == "away" else
+               "🏠 Хтось удома — сповіщення про рух вимкнено")
+        threading.Thread(target=send_message, args=(msg,), daemon=True).start()
+
+
+activity_log = activity.ActivityLog(on_event=_on_activity)
 recorder.start()
 
 
@@ -709,6 +733,8 @@ def state_payload():
                                   "reason": sched_reason,
                                   "profile": sched_profile}},
         "recorder": recorder.status(),
+        "home": {**activity_log.guard_state(),
+                 "alerts": activity_log.alerts_on()},
         "events": events,
     }
 
@@ -771,6 +797,24 @@ def api_activity():
         near = [cid for ts, cid in clips if -15 <= ts - r["ts"] <= 15]
         r["clip_id"] = near[0] if near else None
     return jsonify({"ok": True, "activity": rows})
+
+
+@app.route("/api/home", methods=["GET"])
+def api_home_get():
+    """Охорона: home | leaving | away, alerts — чи шлемо рух у Telegram."""
+    return jsonify({"ok": True, **activity_log.guard_state(),
+                    "alerts": activity_log.alerts_on()})
+
+
+@app.route("/api/journal/file")
+def api_journal_file():
+    """Файловий журнал за день: ?day=YYYY-MM-DD (за замовчуванням — сьогодні)."""
+    day = request.args.get("day") or datetime.now().strftime("%Y-%m-%d")
+    try:
+        datetime.strptime(day, "%Y-%m-%d")
+    except ValueError:
+        return jsonify({"ok": False, "error": "day must be YYYY-MM-DD"}), 400
+    return jsonify({"ok": True, "day": day, "events": event_log.read_day(day)})
 
 
 @app.route("/api/activity/snap/<name>")

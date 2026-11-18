@@ -98,6 +98,19 @@ def send_video(path, caption=""):
         return False
 
 
+def send_message(text):
+    """Коротке текстове повідомлення в чат. True — успіх."""
+    if not configured():
+        return False
+    try:
+        r = requests.post(f"{API}/sendMessage",
+                          data={"chat_id": CHAT_ID, "text": text}, timeout=20)
+        return r.ok
+    except requests.RequestException as e:
+        print(f"[tg] sendMessage error: {e}", flush=True)
+        return False
+
+
 def deliver(path, caption=""):
     """Відправити кліп; при невдачі — у чергу повтору. Потім retry."""
     ok = send_video(path, caption)

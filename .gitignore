@@ -34,3 +34,6 @@ activity_zones.json
 
 # One-off analysis scripts
 *_tmp.py
+home_state.json
+home_state.tmp
+journal/

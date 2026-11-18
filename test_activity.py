@@ -31,6 +31,7 @@ class ActivityTest(unittest.TestCase):
         activity.ZONES_PATH = d / "zones.json"
         activity.JOURNAL_DB = d / "j.db"
         activity.SNAP_DIR = d / "snaps"
+        activity.GUARD_PATH = d / "home_state.json"
         activity._cache.update(mtime=None, cfg=None)
         activity.save_zones({"pet_name": "cat", "zones": [DOOR, BOWL]})
         self.log = activity.ActivityLog()
@@ -106,6 +107,74 @@ class ActivityTest(unittest.TestCase):
         self.assertIsNone(activity.snap_path("../journal.db"))
         self.assertIsNone(activity.snap_path("x.png"))
         json.dumps(activity.load_zones())
+
+
+    # -- охорона «вдома нікого»
+    def leave_home(self):
+        self.run_frames(5, [det("person", 0.5, 0.7)])
+        self.run_frames(2, [det("person", 0.1, 0.85)])      # пішла в двері
+        self.run_frames(25, [])                             # leave_home
+
+    def test_away_after_5_min(self):
+        self.leave_home()
+        self.assertEqual(self.log.guard_state()["state"], "leaving")
+        self.assertFalse(self.log.alerts_on(self.t))
+        self.run_frames(4 * 60, [], fps=1)
+        self.assertFalse(self.log.alerts_on(self.t))         # ще 5 хв не минуло
+        self.run_frames(70, [], fps=1)
+        self.assertEqual(self.log.guard_state()["state"], "away")
+        self.assertTrue(self.log.alerts_on(self.t))
+        self.assertIn("away", self.kinds())
+        self.run_frames(30, [det("cat", 0.5, 0.5)])         # кіт — охорона лишається
+        self.assertTrue(self.log.alerts_on(self.t))
+
+    def test_back_within_5_min_is_silent(self):
+        self.leave_home()
+        self.run_frames(60, [], fps=1)
+        self.run_frames(3, [det("person", 0.15, 0.9)])      # повернулась
+        self.assertEqual(self.log.guard_state()["state"], "home")
+        self.run_frames(400, [det("person", 0.5, 0.7)], fps=1)
+        self.assertFalse(self.log.alerts_on(self.t))
+        self.assertNotIn("away", self.kinds())
+
+    def test_person_home_ends_away(self):
+        self.leave_home()
+        self.run_frames(310, [], fps=1)
+        self.run_frames(3, [det("person", 0.15, 0.9)])
+        self.assertEqual(self.log.guard_state()["state"], "home")
+        self.assertIn("home", self.kinds())
+        self.assertTrue(self.log.alerts_on(self.t))         # кліп того, хто зайшов, ще піде
+        self.run_frames(70, [det("person", 0.5, 0.7)], fps=1)
+        self.assertFalse(self.log.alerts_on(self.t))
+
+    def test_room_leave_is_not_away(self):
+        self.run_frames(5, [det("person", 0.5, 0.7)])
+        self.run_frames(400, [], fps=1)                     # пішла не через двері
+        self.assertFalse(self.log.alerts_on(self.t))
+
+    def test_tick_and_restart_keep_state(self):
+        self.leave_home()
+        self.log.tick(self.t + 301)
+        self.assertEqual(self.log.guard_state()["state"], "away")
+        again = activity.ActivityLog()
+        self.assertEqual(again.guard_state()["state"], "away")
+
+
+class EventLogTest(unittest.TestCase):
+    def test_write_and_read_day(self):
+        import event_log
+        with tempfile.TemporaryDirectory() as d:
+            event_log.LOG_DIR = Path(d) / "journal"
+            ts = 1763426525.0
+            event_log.write("motion", ts, [{"cls": "person", "conf": 0.8, "box": [1, 2, 3, 4]}],
+                            alert=True)
+            event_log.write("activity", ts + 5, None, kind="arrive", text="Person came home")
+            from datetime import datetime
+            rows = event_log.read_day(datetime.fromtimestamp(ts).strftime("%Y-%m-%d"))
+            self.assertEqual([r["type"] for r in rows], ["motion", "activity"])
+            self.assertEqual(rows[0]["objects"][0]["cls"], "person")
+            self.assertTrue(rows[0]["alert"])
+            self.assertEqual(rows[1]["time"][:4], "2025")
 
 
 if __name__ == "__main__":

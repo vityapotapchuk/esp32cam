@@ -27,6 +27,15 @@
 * Візит у зону: група є в зоні; закінчується, коли її немає в зоні
   ZONE_GAP_S секунд. Подія пишеться в кінці візиту, з тривалістю.
 
+Режим «вдома нікого» (охорона)
+------------------------------
+Людина вийшла через двері (leave_home) → стан «leaving». Якщо за
+AWAY_AFTER_S (5 хв) людина не з'явилась знову → стан «away»: детектор
+шле в Telegram кожну детекцію руху. Щойно людина знову вдома → стан
+«home», сповіщення вимикаються (з запасом ALERT_GRACE_S, щоб кліп
+того, хто зайшов, теж пішов у Telegram). Стан лежить у home_state.json
+і переживає рестарт сервісу.
+
 Події лежать у journal.db, таблиця activity_log; до кожної — JPEG-кадр
 у activity/ (останні MAX_SNAPS файлів).
 """
@@ -48,6 +57,10 @@ PET_CLASSES = {"cat", "dog", "bird", "horse", "sheep", "cow", "bear", "teddy bea
 ARRIVE_S = {"person": 1.0, "pet": 2.0}     # скільки триматись, щоб «з'явитись»
 GONE_S = {"person": 20.0, "pet": 40.0}     # скільки не бачити, щоб «піти»
 ZONE_GAP_S = 8.0                           # пауза, після якої візит у зону скінчився
+
+AWAY_AFTER_S = 300.0                       # скільки нікого після «пішов з дому» → охорона
+ALERT_GRACE_S = 60.0                       # ще стільки шлемо після повернення людини
+GUARD_PATH = HERE / "home_state.json"
 
 KINDS = ("door", "bowl", "water", "litter", "place")
 DEFAULT_MIN_S = {"door": 0, "bowl": 15, "water": 5, "litter": 20, "place": 30}
@@ -211,8 +224,78 @@ class ActivityLog:
         self.visits = {}            # (zone_id, group) -> _Visit
         self.on_event = on_event    # callback(dict) — напр. для Telegram
         self.recent = []            # останні події (для /api/state)
+        self.guard = self._load_guard()   # {"state": home|leaving|away, "since", "away_end"}
         SNAP_DIR.mkdir(exist_ok=True)
         db_init()
+
+    # -- охорона: «вдома нікого»
+    @staticmethod
+    def _load_guard():
+        try:
+            g = json.loads(GUARD_PATH.read_text())
+            if g.get("state") in ("home", "leaving", "away"):
+                return {"state": g["state"], "since": float(g.get("since") or 0),
+                        "away_end": float(g.get("away_end") or 0)}
+        except (OSError, ValueError, TypeError):
+            pass
+        return {"state": "home", "since": 0.0, "away_end": 0.0}
+
+    def _save_guard(self):
+        try:
+            tmp = GUARD_PATH.with_suffix(".tmp")
+            tmp.write_text(json.dumps(self.guard))
+            os.replace(tmp, GUARD_PATH)
+        except OSError:
+            pass
+
+    def _set_guard(self, state, ts):
+        if state == "home" and self.guard["state"] == "away":
+            self.guard["away_end"] = ts
+        self.guard["state"] = state
+        self.guard["since"] = ts
+        self._save_guard()
+
+    def _guard_step(self, ts, events):
+        """Оновити стан охорони; повертає службові події (away / home)."""
+        out = []
+        person = self.groups["person"]
+        state = self.guard["state"]
+        for ev in events:
+            if ev["kind"] == "leave_home" and ev["actor"] == "person" and not person.present:
+                if state != "away":
+                    self._set_guard("leaving", ev["ts"])
+                    state = "leaving"
+        if person.present:
+            if state == "away":
+                self._set_guard("home", ts)
+                out.append({"ts": ts, "kind": "home", "actor": "person",
+                            "text": "Someone is home · motion alerts off", "jpg": None})
+            elif state == "leaving":
+                self._set_guard("home", ts)          # повернулась до 5 хв — тихо
+        elif state == "leaving" and ts - self.guard["since"] >= AWAY_AFTER_S:
+            self._set_guard("away", ts)
+            out.append({"ts": ts, "kind": "away", "actor": "person",
+                        "text": "Nobody home · motion alerts on", "jpg": None})
+        return out
+
+    def tick(self, ts):
+        """Без кадрів (детектор на паузі за графіком) — лише перевірити таймер охорони."""
+        with self.lock:
+            out = self._guard_step(ts, [])
+        for ev in out:
+            self._store(ev)
+        return out
+
+    def alerts_on(self, ts=None):
+        """Чи слати рух у Telegram зараз: вдома нікого (або щойно повернулись)."""
+        ts = time.time() if ts is None else ts
+        with self.lock:
+            g = self.guard
+            return g["state"] == "away" or ts - g["away_end"] <= ALERT_GRACE_S
+
+    def guard_state(self):
+        with self.lock:
+            return dict(self.guard)
 
     # -- допоміжне
     @staticmethod
@@ -255,6 +338,7 @@ class ActivityLog:
             for g, st in self.groups.items():
                 out += self._presence(ts, g, st, pts[g], jpg, cfg, zones)
             out += self._zone_visits(ts, pts, jpg, cfg, zones)
+            out += self._guard_step(ts, out)
         for ev in out:
             self._store(ev)
         return out
