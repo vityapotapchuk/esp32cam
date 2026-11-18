@@ -30,6 +30,8 @@ from flask import Flask, Response, jsonify, request, send_file
 
 from detect import (MODEL_PATH, STREAM_URL, TARGET_CLASSES, MjpegGrabber,
                     enhance, letterbox, postprocess)
+import motion_config
+import activity
 
 CAM = "http://192.168.1.186"
 PORT = 8084
@@ -68,6 +70,19 @@ FRAMESIZE_NAMES = {0: "qqvga", 1: "qqvga2", 2: "qcif", 3: "cif", 4: "qvga",
 
 app = Flask(__name__)
 
+# --- файловий лог -----------------------------------------------------------
+# journald на цьому хості не персистентний ("No journal files were found"),
+# тому stdout сервісу губиться. Пишемо важливі події рекордера у файл.
+LOG_PATH = Path(__file__).with_name("dashboard.log")
+
+
+def _log(msg):
+    try:
+        with LOG_PATH.open("a") as f:
+            f.write(f"{datetime.now().isoformat(timespec='seconds')} {msg}\n")
+    except Exception:
+        pass
+
 
 def _safe_json(text):
     """Парсить JSON, лікуючи нецитовані значення типу 4MB (баг прошивки)."""
@@ -99,9 +114,18 @@ class Detector(threading.Thread):
         self._cand_n = 0               # скільки кадрів підряд кандидат тримається
         self._cand_t0 = 0.0            # час першого кадру кандидата
         self._clear_n = 0              # кадри підряд без об'єктів
+        # стан графіка (оновлюється в run() з motion_schedule.json)
+        self.sched_active = True
+        self.sched_reason = "schedule-on"
+        self.sched_profile = "weekday"
 
     def run(self):
-        sess = ort.InferenceSession(MODEL_PATH,
+        # 4 дефолтні intra-op потоки ORT крутяться по ~100% CPU навіть
+        # між інференсами (spin-wait) — 2 потоки + без spinning вистачає.
+        opts = ort.SessionOptions()
+        opts.intra_op_num_threads = 2
+        opts.add_session_config_entry("session.intra_op.allow_spinning", "0")
+        sess = ort.InferenceSession(MODEL_PATH, opts,
                                     providers=["CPUExecutionProvider"])
         inp_name = sess.get_inputs()[0].name
         fps_hist = collections.deque(maxlen=30)
@@ -109,9 +133,18 @@ class Detector(threading.Thread):
         ema = 0.0
 
         while not self.stopped:
-            if not self.enabled:
-                # Детектор вимкнено кнопкою: YOLO-інференс не рахуємо
-                # (звільняємо CPU), але кадр оновлюємо — живий стрім
+            # Графік роботи (motion_schedule.json) читається тут, у циклі:
+            # master-перемикач має пріоритет над сіткою, а ручний enabled —
+            # над обома. Розклад діє без браузера й без рестарту сервісу.
+            sched = motion_config.load()
+            sched_on, sched_reason, sched_profile = motion_config.active_now(sched)
+            with self.lock:
+                self.sched_active = sched_on
+                self.sched_reason = sched_reason
+                self.sched_profile = sched_profile
+            if not self.enabled or not sched_on:
+                # Детектор вимкнено кнопкою або графіком: YOLO-інференс не
+                # рахуємо (звільняємо CPU), але кадр оновлюємо — живий стрім
                 # продовжується, просто без рамок і подій.
                 frame = self.grabber.read()
                 if frame is not None:
@@ -156,6 +189,17 @@ class Detector(threading.Thread):
                 raw = postprocess(out, r, dx, dy, frame.shape)
                 dt = time.time() - t0
                 fps_hist.append(1.0 / dt if dt > 0 else 0)
+
+                # --- фільтри з графіка: чутливість, мін. розмір, зона ------
+                # postprocess ріже за сталим CONF_THRES=0.35; тут звужуємо
+                # (або розширюємо) поріг за повзунком чутливості, відсіюємо
+                # дрібні об'єкти та все, що поза зоною детекції.
+                conf_thres = motion_config.conf_thres(sched)
+                min_area = sched["min_area_pct"] / 100.0
+                zone = motion_config.zone_points(sched)
+                if conf_thres > 0.35 or min_area > 0 or zone:
+                    raw = self._apply_filters(raw, frame.shape, conf_thres,
+                                              min_area, zone)
 
                 # --- рамки
                 vis = frame
@@ -207,9 +251,40 @@ class Detector(threading.Thread):
                     elif gone and self.last_classes:
                         self._event(now, "clear", [])
                         self.last_classes = set()
+                # журнал дій (прийшов/пішов, кіт поїв…) — на кожному кадрі,
+                # бо «пішов» визначається саме відсутністю об'єктів
+                try:
+                    activity_log.update(now, dets, vis.shape,
+                                        jpg.tobytes() if ok else None)
+                except Exception as e:
+                    _log(f"[activity] {type(e).__name__}: {e}")
             except Exception as e:  # не вмирати від разових збоїв
                 self.error = str(e)
                 time.sleep(0.5)
+
+    def _apply_filters(self, raw, shape, conf_thres, min_area, zone):
+        """Відсіяти детекції за чутливістю, мін. площею та зоною.
+
+        raw — [(box, conf, cls)] з postprocess. zone — полігон у
+        нормалізованих координатах 0..1 (або None = весь кадр).
+        Об'єкт лишається, якщо його центр усередині зони.
+        """
+        h, w = shape[:2]
+        frame_area = float(h * w) or 1.0
+        out = []
+        for (bx, conf, c) in raw:
+            if conf < conf_thres:
+                continue
+            x1, y1, x2, y2 = map(float, bx)
+            if (max(0.0, x2 - x1) * max(0.0, y2 - y1)) / frame_area < min_area:
+                continue
+            if zone:
+                cx = (x1 + x2) / 2.0 / w
+                cy = (y1 + y2) / 2.0 / h
+                if not motion_config.point_in_polygon(cx, cy, zone):
+                    continue
+            out.append((bx, conf, c))
+        return out
 
     def _debounce(self, classes, now):
         """Дебаунс подій. classes — множина класів поточного кадру.
@@ -350,7 +425,7 @@ def journal_list(limit=100):
     return [dict(r) for r in rows]
 
 
-class ClipRecorder(threading.Thread):
+class ClipRecorder:
     """Пише 10-секундні H.264 MP4-кліпи з анотованих кадрів детектора.
 
     Тригер — подія детекції (appear/change/clear). Кліп починається з моменту
@@ -358,26 +433,68 @@ class ClipRecorder(threading.Thread):
     .mp4 через pipe у статичний ffmpeg (libx264, yuv420p — грає в браузерах),
     потім реєструється в SQLite. Поки йде запис — нові тригери ігноруються
     (один кліп за раз, інакше на Pi 2 кадри одночасно не потягнути).
+
+    Самовідновлення: робочий потік може померти або зависнути (напр. на
+    write() у ffmpeg). Тоді прапорець writing лишався True назавжди, і
+    trigger() мовчки відкидав усі події — саме це сталося 30.09. Тепер
+    trigger() перевіряє, чи живий потік і чи не вичерпано жорсткий ліміт
+    HARD_TIMEOUT, і за потреби піднімає новий потік.
     """
 
+    HARD_TIMEOUT = CLIP_SECONDS + 120   # жорсткий ліміт на один кліп, с
+
     def __init__(self):
-        super().__init__(daemon=True, name="clip-recorder")
         self.lock = threading.Lock()
-        self.queue = []            # (класи, journal_id), що чекають на запис
+        self.queue = []            # [класи, journal_id], що чекають на запис
         self.writing = False       # зараз пишеться кліп
+        self.writing_since = 0.0   # коли почався поточний запис
         self.last_clip = None      # {id, ts, classes, path, size, duration, frames}
         self.error = None
+        self._worker = None        # робочий потік
+        self._proc = None          # поточний ffmpeg (щоб убити при скиданні)
         CLIPS_DIR.mkdir(exist_ok=True)
         LIGHT_DIR.mkdir(exist_ok=True)
         db_init()
         journal_init()
 
+    def start(self):
+        self._ensure_worker()
+
+    def _ensure_worker(self, force=False):
+        """Підняти робочий потік, якщо він помер (або примусово)."""
+        w = self._worker
+        if force or w is None or not w.is_alive():
+            w = threading.Thread(target=self._loop, daemon=True,
+                                 name="clip-recorder")
+            self._worker = w
+            w.start()
+
     def trigger(self, classes, journal_id=None):
         """Викликається з Detector._event — поставити класи в чергу."""
         with self.lock:
+            w = self._worker
+            dead = w is None or not w.is_alive()
+            stuck = (self.writing
+                     and time.time() - self.writing_since > self.HARD_TIMEOUT)
+            stale = None
+            if dead or stuck:
+                if self.writing or self.queue:
+                    self.error = ("watchdog: потік рекордера помер"
+                                  if dead else "watchdog: скинуто завислий запис")
+                    _log(f"[recorder] {self.error}")
+                self.writing = False
+                self.queue = []
+                stale = self._proc
+                self._proc = None
             if self.writing or self.queue:
                 return
-            self.queue = [list(classes), journal_id]
+            self.queue = [(list(classes), journal_id)]
+        if stale is not None:
+            try:
+                stale.kill()
+            except Exception:
+                pass
+        self._ensure_worker(force=stuck)
 
     def status(self):
         with self.lock:
@@ -385,23 +502,26 @@ class ClipRecorder(threading.Thread):
                     "last": dict(self.last_clip) if self.last_clip else None,
                     "error": self.error}
 
-    def run(self):
+    def _loop(self):
         while True:
             with self.lock:
                 item = self.queue.pop(0) if self.queue else None
                 self.writing = item is not None
+                if item is not None:
+                    self.writing_since = time.time()
             if item is None:
                 time.sleep(0.25)
                 continue
-            classes, jid = item[0], item[1]
             try:
+                classes, jid = item
                 self._record(classes, jid)
             except Exception as e:
                 self.error = f"{type(e).__name__}: {e}"
-                print(f"[recorder] {self.error}", flush=True)
+                _log(f"[recorder] {self.error}")
             finally:
                 with self.lock:
                     self.writing = False
+                    self._proc = None
 
     def _record(self, classes, journal_id=None):
         t0 = time.time()
@@ -419,10 +539,18 @@ class ClipRecorder(threading.Thread):
              "-f", "rawvideo", "-pix_fmt", "bgr24",
              "-s", "{0}x{1}".format(*self._size()), "-r", "10",
              "-i", "pipe:0",
-             "-c:v", "libx264", "-preset", "veryfast", "-crf", "26",
+             "-c:v", "libx264", "-preset", "ultrafast", "-threads", "2",
+             "-crf", "26",
              "-pix_fmt", "yuv420p", "-movflags", "+faststart",
              "-f", "mp4", str(tmp)],
             stdin=subprocess.PIPE)
+        self._proc = proc
+        # Watchdog: якщо ffmpeg перестав споживати stdin, proc.stdin.write()
+        # блокується НАЗАВЖДИ (саме це застрягло 09-09) — вбиваємо ffmpeg,
+        # write() кине BrokenPipeError, цикл завершиться, finally прибере.
+        watchdog = threading.Timer(CLIP_SECONDS + 60, proc.kill)
+        watchdog.daemon = True
+        watchdog.start()
         frames = 0
         deadline = t0 + CLIP_SECONDS
         while time.time() < deadline:
@@ -441,7 +569,15 @@ class ClipRecorder(threading.Thread):
             proc.stdin.close()
         except OSError:
             pass
-        proc.wait(timeout=30)
+        try:
+            proc.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=10)
+            self.error = "ffmpeg not exited in 30s — killed"
+        finally:
+            watchdog.cancel()
+        duration = time.time() - t0
         duration = time.time() - t0
         if proc.returncode != 0 or not tmp.exists() or tmp.stat().st_size == 0:
             tmp.unlink(missing_ok=True)
@@ -453,9 +589,9 @@ class ClipRecorder(threading.Thread):
             subprocess.run(
                 [FFMPEG, "-y", "-loglevel", "error", "-i", str(final),
                  "-vf", f"scale=-2:{LIGHT_HEIGHT}", "-c:v", "libx264",
-                 "-preset", "veryfast", "-crf", LIGHT_CRF,
+                 "-preset", "ultrafast", "-threads", "2", "-crf", LIGHT_CRF,
                  "-pix_fmt", "yuv420p", "-movflags", "+faststart",
-                 "-an", str(light_tmp)],
+                 "-an", "-f", "mp4", str(light_tmp)],
                 check=True, timeout=120)
             light_tmp.rename(light_final)
             light_name_db = light_name
@@ -498,6 +634,7 @@ class ClipRecorder(threading.Thread):
 
 
 recorder = ClipRecorder()
+activity_log = activity.ActivityLog()
 recorder.start()
 
 
@@ -552,6 +689,9 @@ def state_payload():
         events = list(detector.events)
         fps, frames, motion = detector.fps, detector.frames, detector.motion
         det_error = detector.error
+        sched_active = detector.sched_active
+        sched_reason = detector.sched_reason
+        sched_profile = detector.sched_profile
     frame_age = None
     if grabber.frame is not None:
         frame_age = 0  # останній кадр у пам'яті; вік не критичний
@@ -564,7 +704,10 @@ def state_payload():
                    "clients": status.get("stream_clients")},
         "detector": {"fps": fps, "frames": frames, "motion_pct": motion,
                      "detections": dets, "error": det_error,
-                     "enabled": detector.enabled},
+                     "enabled": detector.enabled,
+                     "schedule": {"active": sched_active,
+                                  "reason": sched_reason,
+                                  "profile": sched_profile}},
         "recorder": recorder.status(),
         "events": events,
     }
@@ -608,6 +751,51 @@ def api_clips():
 def api_journal():
     """Журнал руху: дата+час початку руху, класи, кліпи, статус Telegram."""
     return jsonify({"journal": journal_list(200)})
+
+
+@app.route("/api/activity")
+def api_activity():
+    """Журнал дій: «прийшов додому», «кіт поїв»… — новіші першими.
+
+    ?before=<ts> — сторінка старіших подій. До кожної — clip_id кліпу,
+    що почався в межах 15 с від події (якщо є).
+    """
+    try:
+        before = float(request.args.get("before") or 0) or None
+        limit = max(1, min(500, int(request.args.get("limit") or 200)))
+    except ValueError:
+        return jsonify({"ok": False, "error": "bad before/limit"}), 400
+    rows = activity.db_list(limit, before)
+    clips = [(c["ts"], c["id"]) for c in db_list(1000)]
+    for r in rows:
+        near = [cid for ts, cid in clips if -15 <= ts - r["ts"] <= 15]
+        r["clip_id"] = near[0] if near else None
+    return jsonify({"ok": True, "activity": rows})
+
+
+@app.route("/api/activity/snap/<name>")
+def api_activity_snap(name):
+    p = activity.snap_path(name)
+    if p is None:
+        return ("no such picture", 404)
+    return send_file(p, mimetype="image/jpeg", max_age=86400)
+
+
+@app.route("/api/activity/zones", methods=["GET"])
+def api_zones_get():
+    return jsonify({"ok": True, **activity.load_zones()})
+
+
+@app.route("/api/activity/zones", methods=["POST"])
+def api_zones_set():
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({"ok": False, "error": "JSON object expected"}), 400
+    try:
+        cfg = activity.save_zones(data)
+    except OSError as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+    return jsonify({"ok": True, **cfg})
 
 
 @app.route("/api/clips/<int:cid>/video")
@@ -673,6 +861,42 @@ def api_snapshot():
         return Response(r.content, mimetype="image/jpeg")
     except requests.RequestException as e:
         return (str(e), 502)
+
+
+@app.route("/api/schedule", methods=["GET"])
+def api_schedule_get():
+    """Поточний графік детекції + що діє просто зараз.
+
+    Читає motion_schedule.json — той самий файл, з яким звіряється
+    Detector-потік, тому UI бачить рівно те, що бачить детектор.
+    """
+    return jsonify(motion_config.snapshot())
+
+
+@app.route("/api/schedule", methods=["POST"])
+def api_schedule_set():
+    """Зберегти графік у motion_schedule.json (атомарний запис).
+
+    Детектор підхоплює зміни на наступному кадрі — рестарт не потрібен.
+    """
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({"ok": False, "error": "потрібен JSON-об'єкт"}), 400
+    try:
+        motion_config.save(data)
+    except OSError as e:
+        return jsonify({"ok": False, "error": f"не вдалось записати: {e}"}), 500
+    return jsonify({"ok": True, **motion_config.snapshot()})
+
+
+@app.route("/api/schedule/reset", methods=["POST"])
+def api_schedule_reset():
+    """Скинути графік до дефолту (детекція цілодобово)."""
+    try:
+        motion_config.save(motion_config.default_config())
+    except OSError as e:
+        return jsonify({"ok": False, "error": f"не вдалось записати: {e}"}), 500
+    return jsonify({"ok": True, **motion_config.snapshot()})
 
 
 if __name__ == "__main__":

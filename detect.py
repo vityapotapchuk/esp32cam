@@ -29,16 +29,20 @@ TARGET_CLASSES = {
 CONF_THRES = 0.35
 NMS_THRES = 0.45
 IMGSZ = 640
-FLIP180 = True  # камера змонтована догори дриґом
+FLIP180 = False  # орієнтацію задає сама камера (vflip/hmirror у HomeOS), інакше Boxes показує картинку перевернутою
 GAMMA = 1.8     # програмне висвітлення тіней (None = вимкнути)
+
+
+# LUT рахується ОДИН раз на імпорті (раніше — на кожному кадрі:
+# 256-елементний Python-цикл по 5.5 fps просто так).
+_GAMMA_LUT = np.array([((i / 255.0) ** (1.0 / GAMMA)) * 255
+                       for i in range(256)]).clip(0, 255).astype(np.uint8)
 
 
 def enhance(img):
     if not GAMMA:
         return img
-    lut = np.array([((i / 255.0) ** (1.0 / GAMMA)) * 255
-                    for i in range(256)]).clip(0, 255).astype(np.uint8)
-    return cv2.LUT(img, lut)
+    return cv2.LUT(img, _GAMMA_LUT)
 
 
 class MjpegGrabber(threading.Thread):

@@ -26,3 +26,11 @@ clips/
 clips.db
 journal.db
 .tg_sent.log
+
+# Runtime state written from HomeOS
+dashboard.log
+motion_schedule.json
+activity_zones.json
+
+# One-off analysis scripts
+*_tmp.py
